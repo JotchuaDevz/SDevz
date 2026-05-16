@@ -8,7 +8,7 @@ const app = express();
 app.use(express.json());
 
 const VALID_SIGNATURES = new Set([
-    "PEGA_AQUI_TU_SHA256_DE_PLAY_STORE".replace(/:/g, "").toLowerCase(),
+    "24:9E:53:32:29:6B:3A:7F:A0:DB:17:F3:D2:8D:28:C1:78:B8:81:C4:AC:CC:12:E2:F5:39:BD:6B:A8:07:EC:91".replace(/:/g, "").toLowerCase(),
 ]);
 
 const HMAC_SECRET = Buffer.from([
