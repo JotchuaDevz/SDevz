@@ -15,32 +15,54 @@ const VALID_SIGNATURES = new Set([
 ]);
 
 const HMAC_SECRET = Buffer.from([
-    0x4b, 0x39, 0x21, 0x7f, 0x4e, 0x2a, 0x55, 0x68,
-    0x3c, 0x91, 0xb2, 0x0d, 0x6e, 0x47, 0xc8, 0x13,
-    0x9a, 0xf1, 0x5e, 0x72, 0x04, 0x88, 0xd3, 0x60,
-    0xab, 0x1c, 0x57, 0xe9, 0x30, 0x76, 0xfd, 0x2b,
+    0x4b, 0x39, 0x21, 0x7f,
+    0x4e, 0x2a, 0x55, 0x68,
+    0x3c, 0x91, 0xb2, 0x0d,
+    0x6e, 0x47, 0xc8, 0x13,
+    0x9a, 0xf1, 0x5e, 0x72,
+    0x04, 0x88, 0xd3, 0x60,
+    0xab, 0x1c, 0x57, 0xe9,
+    0x30, 0x76, 0xfd, 0x2b,
 ]);
 
 const JWT_SECRET =
-    process.env.JWT_SECRET ?? "change-me-in-production";
+    process.env.JWT_SECRET ??
+    "change-me-in-production";
 
 const MAX_CLOCK_SKEW_SECONDS = 60;
-const PORT = process.env.PORT ?? 3000;
 
-function verifyHmac(signatureHash, timestamp, receivedHmac) {
+const PORT =
+    process.env.PORT ?? 3000;
 
-    const payload = `${signatureHash}:${timestamp}`;
+function verifyHmac(
+    signatureHash,
+    timestamp,
+    receivedHmac
+) {
+
+    const payload =
+        `${signatureHash}:${timestamp}`;
 
     const expected = crypto
-        .createHmac("sha256", HMAC_SECRET)
+        .createHmac(
+            "sha256",
+            HMAC_SECRET
+        )
         .update(payload, "utf8")
         .digest("hex");
 
-    const expectedBuf = Buffer.from(expected, "hex");
-    const receivedBuf = Buffer.from(receivedHmac, "hex");
+    const expectedBuf =
+        Buffer.from(expected, "hex");
 
-    if (expectedBuf.length !== receivedBuf.length)
+    const receivedBuf =
+        Buffer.from(receivedHmac, "hex");
+
+    if (
+        expectedBuf.length !==
+        receivedBuf.length
+    ) {
         return false;
+    }
 
     return crypto.timingSafeEqual(
         expectedBuf,
@@ -48,9 +70,12 @@ function verifyHmac(signatureHash, timestamp, receivedHmac) {
     );
 }
 
-function generateSessionToken(packageName) {
+function generateSessionToken(
+    packageName
+) {
 
-    const now = Math.floor(Date.now() / 1000);
+    const now =
+        Math.floor(Date.now() / 1000);
 
     const header = Buffer
         .from(JSON.stringify({
@@ -69,119 +94,187 @@ function generateSessionToken(packageName) {
         .toString("base64url");
 
     const sig = crypto
-        .createHmac("sha256", JWT_SECRET)
-        .update(`${header}.${payload}`)
+        .createHmac(
+            "sha256",
+            JWT_SECRET
+        )
+        .update(
+            `${header}.${payload}`
+        )
         .digest("base64url");
 
     return `${header}.${payload}.${sig}`;
 }
 
-app.post("/api/validate-signature", (req, res) => {
+app.post(
+    "/api/validate-signature",
+    (req, res) => {
 
-    const {
-        signatureHash,
-        timestamp,
-        hmac,
-        packageName
-    } = req.body;
-
-    if (
-        !signatureHash ||
-        !timestamp ||
-        !hmac ||
-        !packageName
-    ) {
-        return res.status(400).json({
-            valid: false,
-            reason: "Campos faltantes"
-        });
-    }
-
-    const now = Math.floor(Date.now() / 1000);
-
-    if (
-        Math.abs(now - timestamp) >
-        MAX_CLOCK_SKEW_SECONDS
-    ) {
-        return res.status(401).json({
-            valid: false,
-            reason: "Solicitud expirada"
-        });
-    }
-
-    let hmacValid = false;
-
-    try {
-
-        hmacValid = verifyHmac(
+        const {
             signatureHash,
             timestamp,
-            hmac
-        );
-
-    } catch {
-
-        return res.status(401).json({
-            valid: false,
-            reason: "HMAC inválido"
-        });
-    }
-
-    if (!hmacValid) {
-
-        return res.status(401).json({
-            valid: false,
-            reason: "HMAC inválido"
-        });
-    }
-
-    const normalizedHash = signatureHash
-        .replace(/:/g, "")
-        .toLowerCase();
-
-    /*
-     * Detectar MT Manager
-     */
-    if (
-        normalizedHash.includes("mt_manager") ||
-        normalizedHash.includes("killerapplication")
-    ) {
-
-        console.log(
-            "[SECURITY] MT Manager detectado:",
+            hmac,
             packageName
-        );
+        } = req.body;
 
-        return res.status(403).json({
-            valid: false,
-            reason: "Acceso denegado"
+        /*
+         * Campos faltantes
+         */
+        if (
+            !signatureHash ||
+            !timestamp ||
+            !hmac ||
+            !packageName
+        ) {
+
+            return res
+                .status(400)
+                .json({
+                    valid: false,
+                    reason:
+                        "Campos faltantes"
+                });
+        }
+
+        /*
+         * Tiempo expirado
+         */
+        const now =
+            Math.floor(
+                Date.now() / 1000
+            );
+
+        if (
+            Math.abs(
+                now - timestamp
+            ) >
+            MAX_CLOCK_SKEW_SECONDS
+        ) {
+
+            return res
+                .status(401)
+                .json({
+                    valid: false,
+                    reason:
+                        "Solicitud expirada"
+                });
+        }
+
+        /*
+         * Verificar HMAC
+         */
+        let hmacValid = false;
+
+        try {
+
+            hmacValid = verifyHmac(
+                signatureHash,
+                timestamp,
+                hmac
+            );
+
+        } catch {
+
+            return res
+                .status(401)
+                .json({
+                    valid: false,
+                    reason:
+                        "HMAC inválido"
+                });
+        }
+
+        if (!hmacValid) {
+
+            return res
+                .status(401)
+                .json({
+                    valid: false,
+                    reason:
+                        "HMAC inválido"
+                });
+        }
+
+        /*
+         * Detectar MT Manager /
+         * Signature Killer /
+         * Manifest modificado
+         */
+        if (
+
+            signatureHash ===
+            "mt_manager_killerApplication_detected"
+
+            ||
+
+            signatureHash ===
+            "manifest_application_modified"
+
+        ) {
+
+            console.log(
+                "[SECURITY] Modificación detectada:",
+                {
+                    packageName,
+                    signatureHash
+                }
+            );
+
+            return res
+                .status(403)
+                .json({
+                    valid: false,
+                    reason:
+                        "Acceso denegado"
+                });
+        }
+
+        /*
+         * Normalizar hash
+         */
+        const normalizedHash =
+            signatureHash
+                .replace(/:/g, "")
+                .toLowerCase();
+
+        /*
+         * Firma inválida
+         */
+        if (
+            !VALID_SIGNATURES.has(
+                normalizedHash
+            )
+        ) {
+
+            console.log(
+                "[SECURITY] Firma inválida:",
+                {
+                    packageName,
+                    hash: normalizedHash
+                }
+            );
+
+            return res
+                .status(403)
+                .json({
+                    valid: false,
+                    reason:
+                        "Acceso denegado"
+                });
+        }
+
+        /*
+         * Build válida
+         */
+        return res.json({
+            valid: true,
+            sessionToken:
+                generateSessionToken(
+                    packageName
+                )
         });
     }
-
-    /*
-     * Firma no autorizada
-     */
-    if (!VALID_SIGNATURES.has(normalizedHash)) {
-
-        console.log(
-            "[SECURITY] Firma inválida:",
-            normalizedHash
-        );
-
-        return res.status(403).json({
-            valid: false,
-            reason: "Acceso denegado"
-        });
-    }
-
-    /*
-     * Build válida
-     */
-    return res.json({
-        valid: true,
-        sessionToken: generateSessionToken(packageName)
-    });
-});
+);
 
 app.listen(PORT, () => {
 
