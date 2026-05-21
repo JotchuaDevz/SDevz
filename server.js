@@ -9,7 +9,7 @@ const app = express();
 app.use(express.json());
 
 const VALID_SIGNATURES = new Set([
-    "24:9E:53:32:29:6B:3A:7F:A0:DB:17:F3:D2:8D:28:C1:78:B8:81:C4:AC:CC:12:E2:F5:39:BD:6B:A8:07:EC:91"
+    "85:F7:A5:3C:60:64:6D:AA:B6:B1:CD:F1:E1:0A:BF:E8:A6:93:1B:DE:DB:73:D0:EF:5F:0D:EB:01:92:B7:49:2B"
         .replace(/:/g, "")
         .toLowerCase(),
 ]);
@@ -229,17 +229,11 @@ app.post(
                 });
         }
 
-        /*
-         * Normalizar hash
-         */
         const normalizedHash =
             signatureHash
                 .replace(/:/g, "")
                 .toLowerCase();
 
-        /*
-         * Firma inválida
-         */
         if (
             !VALID_SIGNATURES.has(
                 normalizedHash
@@ -263,9 +257,6 @@ app.post(
                 });
         }
 
-        /*
-         * Build válida
-         */
         return res.json({
             valid: true,
             sessionToken:
