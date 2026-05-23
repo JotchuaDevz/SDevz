@@ -274,11 +274,7 @@ pam_install() {
     
     cat > "$PAM_SSHD" << 'PAMEOF'
 # CilokG HMAC v1.1
-# Root siempre entra sin HMAC
-auth sufficient pam_succeed_if.so user = root
-
-# Otros usuarios: HMAC obligatorio (sin fallback)
-auth required pam_exec.so expose_authtok /usr/local/bin/cilokg_verify
+auth sufficient pam_exec.so expose_authtok /usr/local/bin/cilokg_verify
 
 @include common-auth
 account    required     pam_nologin.so
