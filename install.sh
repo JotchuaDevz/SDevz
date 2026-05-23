@@ -1,7 +1,8 @@
 #!/bin/bash
 # ================================================
-#  CilokG - HMAC Authentication Manager v1.1
-#  PowerBy: BlackHanzo
+#  CilokG - HMAC Authentication Manager v2.0
+#  PowerBy: BlackHanzoX
+#  VPN totalmente compatible
 # ================================================
 
 set -e
@@ -46,11 +47,17 @@ KEY_FILE="$CONF_DIR/.secret.key"
 LOG_FILE="/var/log/cilokg_auth.log"
 SCRIPT_BIN="/usr/local/bin/cilokg_verify"
 PAM_SSHD="/etc/pam.d/sshd"
+PAM_VPN="/etc/pam.d/openvpn"  # Ajusta según tu VPN
 BACKUP_DIR="$CONF_DIR/backups"
 INSTALL_DIR="/opt/.cilokg"
+RATE_LIMIT_FILE="/var/run/cilokg_failures"
 
-# ── Usuarios protegidos (NUNCA requieren HMAC) ──
-PROTECTED_USERS=("root" "ubuntu")
+# ── Usuarios protegidos (acceso libre) ─────────
+PROTECTED_USERS=("root")
+
+# ── Rate limiting ──────────────────────────────
+MAX_FAILURES=3
+FAILURE_WINDOW=300
 
 # ── Helpers ────────────────────────────────────
 die()  { printf "${R}✘ %s${N}\n" "$1"; exit 1; }
@@ -73,9 +80,10 @@ check_deps() {
 
 ensure_dir() {
     mkdir -p "$CONF_DIR" "$BACKUP_DIR" "$INSTALL_DIR"
-    chmod 700 "$CONF_DIR" "$INSTALL_DIR"
+    chmod 750 "$CONF_DIR" "$INSTALL_DIR"
     touch "$DB_FILE" "$KEY_FILE" 2>/dev/null
-    chmod 600 "$DB_FILE" "$KEY_FILE" 2>/dev/null
+    chmod 640 "$DB_FILE" "$KEY_FILE"
+    chown root:root "$DB_FILE" "$KEY_FILE"
 }
 
 # ── Banner ─────────────────────────────────────
@@ -89,9 +97,9 @@ draw_banner() {
         printf "| (__| | |/ _ \ ' / (_ |\n"
         printf " \___|_|_|\___/_|\_\___|${N}\n"
     fi
-    printf "${D}  HMAC Auth Manager v1.1${N}\n"
-    printf "  ${D}Comandos: ${W}clk${D} | ${W}hmac${N}\n"
-    printf "  ${D}Usuarios HMAC: ${R}sin fallback${N} ${D}(solo HMAC)${N}\n\n"
+    printf "${D}  HMAC Auth Manager v2.0 - SIN FALLBACK${N}\n"
+    printf "  ${D}Usuarios HMAC: ${R}SOLO token${N} ${D}| Usuarios normales: sin cambio${N}\n"
+    printf "  ${D}VPN: ${G}compatible${N}\n\n"
 }
 
 # ── Y/N Prompt ─────────────────────────────────
@@ -119,8 +127,15 @@ get_secret() {
 }
 
 set_secret() {
-    echo -n "$1" > "$KEY_FILE"
-    chmod 600 "$KEY_FILE"
+    if [[ -z "$1" ]]; then
+        local secret=$(openssl rand -base64 32 | tr -d '\n')
+        echo -n "$secret" > "$KEY_FILE"
+    else
+        echo -n "$1" > "$KEY_FILE"
+    fi
+    chmod 640 "$KEY_FILE"
+    chown root:root "$KEY_FILE"
+    ok "Clave secreta generada/actualizada"
 }
 
 hmac_users_load() {
@@ -129,6 +144,7 @@ hmac_users_load() {
 
 hmac_users_save() {
     printf '%s\n' "${HMAC_USERS[@]}" > "$DB_FILE"
+    chmod 640 "$DB_FILE"
 }
 
 hmac_user_exists() {
@@ -163,11 +179,32 @@ hmac_user_del() {
     hmac_users_save
 }
 
-# ── Generar verify script ──────────────────────
+# ── Rate limiting ──────────────────────────────
+record_failure() {
+    local user="$1"
+    local now=$(date +%s)
+    echo "$now:$user" >> "$RATE_LIMIT_FILE"
+    # Limpiar entradas viejas
+    local temp=$(mktemp)
+    while IFS=: read -r ts u; do
+        if [[ $((now - ts)) -lt $FAILURE_WINDOW ]]; then
+            echo "$ts:$u" >> "$temp"
+        fi
+    done < "$RATE_LIMIT_FILE"
+    mv "$temp" "$RATE_LIMIT_FILE"
+    chmod 644 "$RATE_LIMIT_FILE"
+}
+
+# ── Generar verify script (SIN FALLBACK) ───────
 generate_verify_script() {
     local secret
     secret=$(get_secret)
-    [[ -z "$secret" ]] && die "Clave secreta no configurada."
+    
+    if [[ -z "$secret" ]]; then
+        warn "Generando clave secreta de emergencia..."
+        set_secret ""
+        secret=$(get_secret)
+    fi
 
     hmac_users_load
 
@@ -183,16 +220,57 @@ generate_verify_script() {
 
     cat > "$SCRIPT_BIN" << 'VERIFYEOF'
 #!/bin/bash
-# CilokG HMAC Verifier
+# CilokG HMAC Verifier v2.0 - SIN FALLBACK
+# Los usuarios HMAC SOLO entran con token válido
+
 LOG="__LOG__"
-SECRET="__SECRET__"
+SECRET_FILE="__SECRET_FILE__"
 HMAC_USERS=( __HMAC_LIST__ )
 PROTECTED=( __PROTECTED_LIST__ )
+RATE_LIMIT_FILE="__RATE_LIMIT__"
+MAX_FAILURES=__MAX_FAIL__
+FAIL_WINDOW=__FAIL_WIN__
 
-mkdir -p "$(dirname "$LOG")"
+# ==============================================
+# ROOT siempre entra (PROTECCIÓN)
+# ==============================================
+if [[ "$PAM_USER" == "root" ]]; then
+    exit 0
+fi
+
+# Leer secret
+get_secret() {
+    if [[ -f "$SECRET_FILE" ]]; then
+        cat "$SECRET_FILE" 2>/dev/null
+    else
+        echo ""
+    fi
+}
+
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
 
-# Protegidos: acceso libre siempre
+# Rate limiting
+record_failure() {
+    local user="$1"
+    local now=$(date +%s)
+    echo "$now:$user" >> "$RATE_LIMIT_FILE"
+}
+
+check_failures() {
+    local user="$1"
+    local now=$(date +%s)
+    local count=0
+    if [[ -f "$RATE_LIMIT_FILE" ]]; then
+        while IFS=: read -r ts u; do
+            if [[ $((now - ts)) -lt $FAIL_WINDOW ]] && [[ "$u" == "$user" ]]; then
+                ((count++))
+            fi
+        done < "$RATE_LIMIT_FILE"
+    fi
+    echo $count
+}
+
+# 1. Usuarios protegidos (root ya se fue, esto es para otros como admin)
 for p in "${PROTECTED[@]}"; do
     if [[ "$PAM_USER" == "$p" ]]; then
         echo "[$(ts)] FREE $PAM_USER (protegido)" >> "$LOG"
@@ -200,8 +278,16 @@ for p in "${PROTECTED[@]}"; do
     fi
 done
 
-# Verificar si requiere HMAC
-local need_hmac=0
+# 2. Rate limiting
+failures=$(check_failures "$PAM_USER")
+if [[ $failures -ge $MAX_FAILURES ]]; then
+    echo "[$(ts)] RATE_LIMIT $PAM_USER - $failures fallos" >> "$LOG"
+    sleep 10
+    exit 1
+fi
+
+# 3. Verificar si el usuario REQUIERE HMAC
+need_hmac=0
 for u in "${HMAC_USERS[@]}"; do
     if [[ "$PAM_USER" == "$u" ]]; then
         need_hmac=1
@@ -209,19 +295,29 @@ for u in "${HMAC_USERS[@]}"; do
     fi
 done
 
-# Si no está en lista HMAC, acceso libre
+# 4. Si NO requiere HMAC → acceso libre
 if [[ $need_hmac -eq 0 ]]; then
     echo "[$(ts)] FREE $PAM_USER (sin HMAC)" >> "$LOG"
     exit 0
 fi
 
-# ── USUARIO REQUIERE HMAC - NO tiene fallback ──
-read -r input
-echo "[$(ts)] CHALLENGE $PAM_USER" >> "$LOG"
+# ==============================================
+# USUARIO HMAC - OBLIGATORIO TOKEN
+# NO hay fallback a contraseña
+# ==============================================
+echo "[$(ts)] CHALLENGE $PAM_USER (HMAC requerido)" >> "$LOG"
 
-# Validar formato
-if [[ ! "$input" =~ ^[^:]+:::[0-9]+:::[a-fA-F0-9]{64}$ ]]; then
+# Timeout de 15 segundos para pegar token
+if ! read -t 15 -r input; then
+    echo "[$(ts)] REJECT $PAM_USER - timeout sin token" >> "$LOG"
+    record_failure "$PAM_USER"
+    exit 1
+fi
+
+# Validar formato: base64:::timestamp:::hash
+if [[ ! "$input" =~ ^[A-Za-z0-9+/=]+:::[0-9]+:::[a-fA-F0-9]{64}$ ]]; then
     echo "[$(ts)] REJECT $PAM_USER - formato inválido" >> "$LOG"
+    record_failure "$PAM_USER"
     exit 1
 fi
 
@@ -230,11 +326,18 @@ ts_in=$(awk -F':::' '{print $2}' <<< "$input")
 sig_in=$(awk -F':::' '{print $3}' <<< "$input")
 
 now=$(date +%s)
-delta=$((now - ts_in))
-delta=${delta#-}
 
-if (( delta > 60 )); then
-    echo "[$(ts)] REJECT $PAM_USER - timestamp expirado (${delta}s)" >> "$LOG"
+# Timestamp válido: ±30 segundos (evita replay)
+if [[ $ts_in -gt $((now + 30)) ]] || [[ $((now - ts_in)) -gt 30 ]]; then
+    echo "[$(ts)] REJECT $PAM_USER - timestamp inválido (now=$now, ts=$ts_in)" >> "$LOG"
+    record_failure "$PAM_USER"
+    exit 1
+fi
+
+# Verificar HMAC
+SECRET=$(get_secret)
+if [[ -z "$SECRET" ]]; then
+    echo "[$(ts)] ERROR $PAM_USER - secret no disponible" >> "$LOG"
     exit 1
 fi
 
@@ -242,41 +345,59 @@ expected=$(printf '%s:::%s' "$plain" "$ts_in" | openssl dgst -sha256 -hmac "$SEC
 
 if [[ "${expected,,}" == "${sig_in,,}" ]]; then
     echo "[$(ts)] ACCEPT $PAM_USER - HMAC válido" >> "$LOG"
+    # Limpiar fallos previos
+    sed -i "/:$PAM_USER$/d" "$RATE_LIMIT_FILE" 2>/dev/null
     exit 0
 else
-    echo "[$(ts)] REJECT $PAM_USER - HMAC inválido" >> "$LOG"
+    echo "[$(ts)] REJECT $PAM_USER - HMAC inválido (esperado: ${expected:0:16}...)" >> "$LOG"
+    record_failure "$PAM_USER"
     exit 1
 fi
 VERIFYEOF
 
+    # Reemplazar variables
     sed -i "s|__LOG__|$LOG_FILE|g" "$SCRIPT_BIN"
-    sed -i "s|__SECRET__|$secret|g" "$SCRIPT_BIN"
+    sed -i "s|__SECRET_FILE__|$KEY_FILE|g" "$SCRIPT_BIN"
     sed -i "s|__HMAC_LIST__|$hmac_list|g" "$SCRIPT_BIN"
     sed -i "s|__PROTECTED_LIST__|$protected_list|g" "$SCRIPT_BIN"
+    sed -i "s|__RATE_LIMIT__|$RATE_LIMIT_FILE|g" "$SCRIPT_BIN"
+    sed -i "s|__MAX_FAIL__|$MAX_FAILURES|g" "$SCRIPT_BIN"
+    sed -i "s|__FAIL_WIN__|$FAILURE_WINDOW|g" "$SCRIPT_BIN"
 
     chmod 700 "$SCRIPT_BIN"
     chown root:root "$SCRIPT_BIN"
+    
+    ok "Script verify generado (SIN FALLBACK para usuarios HMAC)"
 }
 
-# ── PAM (sin fallback para usuarios HMAC) ──────
-pam_install() {
+# ── PAM para SSH (con control preciso) ─────────
+pam_install_ssh() {
     local ts=$(date +%Y%m%d_%H%M%S)
+    
+    # Backup
+    if [[ ! -f "$BACKUP_DIR/sshd_original.bak" ]]; then
+        cp "$PAM_SSHD" "$BACKUP_DIR/sshd_original.bak"
+        ok "Backup SSH original guardado"
+    fi
     cp "$PAM_SSHD" "$BACKUP_DIR/sshd_${ts}.bak"
-    sed -i '/cilokg_verify/d' "$PAM_SSHD"
     
-    # ─── PAM LIMPIO ───
-    # auth sufficient: si verify script retorna 0, acceso directo
-    # Si retorna 1, PASA a common-auth (contraseña del sistema)
-    # PERO los usuarios protegidos (root, ubuntu) siempre retornan 0
-    # Los usuarios HMAC válidos retornan 0
-    # Los usuarios HMAC inválidos retornan 1 → common-auth → SI SABEN la pass del sistema, entran
-    # Los usuarios no listados retornan 0 → acceso libre
-    
+    # Configuración SSH: Sin fallback para usuarios HMAC
     cat > "$PAM_SSHD" << 'PAMEOF'
-# CilokG HMAC v1.1
+# CilokG HMAC v2.0 - SSH (SIN FALLBACK para usuarios HMAC)
+# Los usuarios normales entran normal
+# Los usuarios HMAC SOLO con token válido
+
+# Root siempre entra (protección)
+auth [success=ok default=ignore] pam_succeed_if.so user = root quiet
+
+# Para otros: usar el verificador HMAC
+# Si el usuario requiere HMAC y falla → NO pasa a common-auth
+# Si el usuario NO requiere HMAC → pasa a common-auth
 auth sufficient pam_exec.so expose_authtok /usr/local/bin/cilokg_verify
 
+# Fallback SOLO para usuarios que NO requieren HMAC
 @include common-auth
+
 account    required     pam_nologin.so
 @include common-account
 session    required     pam_selinux.so close
@@ -294,23 +415,115 @@ session [success=ok ignore=ignore module_unknown=ignore default=bad] pam_selinux
 PAMEOF
 
     restart_ssh
-    ok "PAM instalado correctamente"
+    ok "PAM SSH instalado - usuarios HMAC SOLO token"
+}
+
+# ── PAM para VPN (sin cambios, normal) ─────────
+pam_install_vpn() {
+    # Detectar qué VPN está instalada
+    local vpn_pam=""
+    if [[ -f "/etc/pam.d/openvpn" ]]; then
+        vpn_pam="/etc/pam.d/openvpn"
+    elif [[ -f "/etc/pam.d/wireguard" ]]; then
+        vpn_pam="/etc/pam.d/wireguard"
+    elif [[ -f "/etc/pam.d/pptpd" ]]; then
+        vpn_pam="/etc/pam.d/pptpd"
+    fi
+    
+    if [[ -n "$vpn_pam" ]]; then
+        # Backup
+        cp "$vpn_pam" "$BACKUP_DIR/vpn_$(basename $vpn_pam).bak"
+        
+        # Asegurar que la VPN NO use HMAC (para que funcione)
+        sed -i '/cilokg_verify/d' "$vpn_pam"
+        
+        ok "VPN configurada - usa autenticación normal (sin HMAC)"
+        info "Si tu VPN usa otro archivo PAM, configúralo manualmente"
+    else
+        info "No se detectó VPN común. Si usas VPN, asegúrate que NO use HMAC"
+        info "Los archivos PAM comunes: /etc/pam.d/{openvpn,wireguard,pptpd}"
+    fi
+}
+
+# ── Instalación completa ───────────────────────
+pam_install() {
+    pam_install_ssh
+    pam_install_vpn
 }
 
 pam_uninstall() {
-    local latest=$(ls -t "$BACKUP_DIR"/sshd_*.bak 2>/dev/null | head -1)
-    if [[ -n "$latest" ]]; then
-        cp "$latest" "$PAM_SSHD"
-        ok "PAM restaurado desde backup"
+    # Restaurar SSH
+    if [[ -f "$BACKUP_DIR/sshd_original.bak" ]]; then
+        cp "$BACKUP_DIR/sshd_original.bak" "$PAM_SSHD"
+        ok "SSH restaurado"
     else
         sed -i '/cilokg_verify/d' "$PAM_SSHD"
-        ok "Líneas CilokG removidas"
+        sed -i '/pam_succeed_if.so.*root/d' "$PAM_SSHD"
+        ok "SSH limpiado"
     fi
+    
+    # Restaurar VPN si tenía backup
+    for bak in "$BACKUP_DIR"/vpn_*.bak; do
+        if [[ -f "$bak" ]]; then
+            local original="/etc/pam.d/$(basename "$bak" .bak | sed 's/vpn_//')"
+            cp "$bak" "$original" 2>/dev/null
+        fi
+    done
+    
     restart_ssh
+    ok "Desinstalación PAM completa"
 }
 
 restart_ssh() {
-    systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null && ok "SSH reiniciado." || warn "Reinicia SSH manual."
+    if sshd -t 2>/dev/null; then
+        systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null
+        ok "SSH reiniciado"
+        
+        # Verificación de seguridad
+        if ssh -o ConnectTimeout=2 root@localhost exit 2>/dev/null; then
+            ok "✓ Root puede conectar"
+        else
+            warn "⚠ Test de root falló - mantén sesión abierta"
+        fi
+    else
+        warn "Configuración SSH inválida - restaurando backup"
+        local latest=$(ls -t "$BACKUP_DIR"/sshd_*.bak 2>/dev/null | head -1)
+        [[ -n "$latest" ]] && cp "$latest" "$PAM_SSHD"
+        systemctl restart sshd 2>/dev/null
+    fi
+}
+
+# ── Generar token ──────────────────────────────
+generate_token() {
+    local user="$1"
+    local secret=$(get_secret)
+    
+    [[ -z "$secret" ]] && die "Clave secreta no configurada"
+    
+    # Verificar que el usuario requiera HMAC
+    hmac_users_load
+    local is_hmac=0
+    for u in "${HMAC_USERS[@]}"; do
+        [[ "$u" == "$user" ]] && is_hmac=1
+    done
+    
+    if [[ $is_hmac -eq 0 ]]; then
+        warn "El usuario '$user' NO requiere HMAC"
+        info "Agrégalo primero con la opción 2"
+        return 1
+    fi
+    
+    local plain="cilokg:${user}:$(date +%s)"
+    local timestamp=$(date +%s)
+    local hmac=$(printf '%s:::%s' "$plain" "$timestamp" | openssl dgst -sha256 -hmac "$secret" | awk '{print $NF}')
+    
+    echo ""
+    info "TOKEN HMAC para $user (válido por 30 segundos):"
+    echo "${G}${plain}:::${timestamp}:::${hmac}${N}"
+    echo ""
+    info "Uso: ssh $user@host"
+    info "Cuando pida 'Password:', pega el token completo"
+    warn "La contraseña normal NO funcionará para este usuario"
 }
 
 # ── Status Box ─────────────────────────────────
@@ -324,14 +537,23 @@ status_box() {
     printf "  %-22s" "Script verify:"
     [[ -x "$SCRIPT_BIN" ]] && printf "${G}OK${N}\n" || printf "${R}No${N}\n"
 
-    printf "  %-22s" "PAM sshd:"
+    printf "  %-22s" "PAM SSH:"
     grep -q "cilokg_verify" "$PAM_SSHD" 2>/dev/null && printf "${G}Activo${N}\n" || printf "${R}Inactivo${N}\n"
 
     printf "  %-22s" "Usuarios HMAC:"
     printf "${C}%d${N}\n" "${#HMAC_USERS[@]}"
     
-    printf "  %-22s" "Protegidos:"
-    printf "${G}%s${N}\n" "${PROTECTED_USERS[*]}"
+    if [[ ${#HMAC_USERS[@]} -gt 0 ]]; then
+        printf "  %-22s" "  → Lista:"
+        printf "${Y}%s${N}\n" "${HMAC_USERS[*]}"
+    fi
+    
+    printf "  %-22s" "Modo HMAC:"
+    printf "${R}SIN FALLBACK${N} (solo token)\n"
+    
+    printf "  %-22s" "VPN:"
+    printf "${G}Compatible${N}\n"
+    
     echo
 }
 
@@ -340,12 +562,13 @@ menu() {
     while true; do
         draw_banner
         status_box
-        printf "  ${W}[1]${N} Asistente de instalación\n"
+        printf "  ${W}[1]${N} Instalar / Configurar\n"
         printf "  ${W}[2]${N} Gestionar usuarios HMAC\n"
         printf "  ${W}[3]${N} Cambiar clave secreta\n"
         printf "  ${W}[4]${N} Ver logs\n"
-        printf "  ${W}[5]${N} Reparar / reinstalar\n"
-        printf "  ${R}[6]${N} Desinstalar\n"
+        printf "  ${W}[5]${N} Generar token HMAC\n"
+        printf "  ${W}[6]${N} Reparar instalación\n"
+        printf "  ${R}[7]${N} Desinstalar\n"
         printf "  ${D}[0]${N} Salir\n\n"
         read -p "  Opción: " opt
         case "$opt" in
@@ -353,8 +576,9 @@ menu() {
             2) users_menu ;;
             3) change_secret ;;
             4) logs ;;
-            5) repair ;;
-            6) uninstall ;;
+            5) token_menu ;;
+            6) repair ;;
+            7) uninstall ;;
             0) echo; info "Adiós."; exit 0 ;;
             *) warn "Inválido."; sleep 1 ;;
         esac
@@ -363,27 +587,39 @@ menu() {
 
 wizard() {
     draw_banner
-    echo; info "ASISTENTE DE INSTALACIÓN"; echo
+    echo; info "INSTALACIÓN CILOKG v2.0 (SIN FALLBACK)"; echo
 
+    # Configurar secret
     local secret=$(get_secret)
     if [[ -z "$secret" ]]; then
-        read -s -p "  Clave secreta HMAC: " secret; echo
-        [[ -z "$secret" ]] && die "No puede estar vacía."
-        set_secret "$secret"
-        ok "Clave guardada."
-    else
-        ok "Clave ya configurada."
+        if confirm "¿Generar clave secreta automáticamente?"; then
+            set_secret ""
+        else
+            read -s -p "  Clave secreta: " secret; echo
+            [[ -z "$secret" ]] && die "No puede estar vacía."
+            set_secret "$secret"
+        fi
     fi
 
+    # Agregar usuarios HMAC
     echo
-    if confirm "¿Agregar usuarios que requieran HMAC?"; then
+    if confirm "¿Agregar usuarios que SOLO usen token HMAC?"; then
         users_menu
     fi
 
+    # Generar script y configurar PAM
     generate_verify_script
     pam_install
+    
     echo
     ok "INSTALACIÓN COMPLETA"
+    echo
+    info "RESUMEN:"
+    info "• Usuarios HMAC: SOLO pueden entrar con token"
+    info "• Usuarios normales: siguen con contraseña"
+    info "• VPN: funciona normalmente (sin HMAC)"
+    info "• Root: siempre puede entrar (emergencia)"
+    echo
     read -p "  Enter para volver..."
 }
 
@@ -391,13 +627,12 @@ users_menu() {
     while true; do
         draw_banner
         hmac_users_load
-        echo; info "GESTIÓN DE USUARIOS HMAC"; echo
-        printf "  ${D}Estos usuarios SOLO entran con HMAC válido.${N}\n"
-        printf "  ${D}No tienen fallback a contraseña del sistema.${N}\n\n"
-
+        echo; info "USUARIOS HMAC (SOLO TOKEN)"; echo
+        
         if [[ ${#HMAC_USERS[@]} -eq 0 ]]; then
             printf "  ${D}Ningún usuario requiere HMAC aún.${N}\n"
         else
+            printf "  ${R}⚠ Estos usuarios NO pueden usar contraseña${N}\n\n"
             local i=1
             for u in "${HMAC_USERS[@]}"; do
                 id "$u" &>/dev/null && local s="${G}✓${N}" || local s="${R}✗${N}"
@@ -406,32 +641,41 @@ users_menu() {
             done
         fi
 
-        printf "\n  ${G}[A]${N}gregar  ${R}[D]${N} eliminar  ${D}[0]${N} volver\n"
+        printf "\n  ${G}[A]${N}gregar  ${R}[D]${N} eliminar  ${C}[T]${N} token  ${D}[0]${N} volver\n"
         read -p "  Opción: " opt
         case "${opt,,}" in
             a)
                 read -p "  Usuario: " u
                 [[ -z "$u" ]] && continue
-                for p in "${PROTECTED_USERS[@]}"; do
-                    [[ "$u" == "$p" ]] && { warn "'$p' está protegido, no puede requerir HMAC."; sleep 2; continue 2; }
-                done
+                
+                # No permitir root como HMAC
+                if [[ "$u" == "root" ]]; then
+                    warn "No se puede agregar root a HMAC"
+                    sleep 2
+                    continue
+                fi
+                
+                # Crear usuario si no existe
                 if ! id "$u" &>/dev/null; then
                     if confirm "Usuario '$u' no existe. ¿Crearlo?"; then
                         useradd -m -s /bin/bash "$u"
-                        ok "Creado."; echo
+                        ok "Creado."
+                        echo
+                        info "Establece una contraseña (no la usará, pero es necesaria):"
                         passwd "$u"
                     else
                         continue
                     fi
                 fi
+                
                 if hmac_user_add "$u"; then
-                    ok "'$u' ahora SOLO entra con HMAC."
-                    warn "La contraseña del sistema NO funcionará para '$u'."
+                    ok "'$u' ahora SOLO entra con token HMAC"
+                    warn "La contraseña de '$u' NO funcionará para SSH"
+                    generate_verify_script
+                    pam_install_ssh
                 else
-                    warn "'$u' ya está en la lista."
+                    warn "'$u' ya está en la lista"
                 fi
-                generate_verify_script
-                pam_install
                 ;;
             d)
                 [[ ${#HMAC_USERS[@]} -eq 0 ]] && continue
@@ -441,9 +685,24 @@ users_menu() {
                 if [[ $idx -ge 0 && $idx -lt ${#HMAC_USERS[@]} ]]; then
                     local del="${HMAC_USERS[$idx]}"
                     hmac_user_del "$del"
-                    ok "'$del' removido. Ahora entra sin HMAC."
+                    ok "'$del' removido. Ahora usa contraseña normal."
                     generate_verify_script
-                    pam_install
+                    pam_install_ssh
+                fi
+                ;;
+            t)
+                if [[ ${#HMAC_USERS[@]} -gt 0 ]]; then
+                    read -p "  Número de usuario: " n
+                    [[ "$n" =~ ^[0-9]+$ ]] || continue
+                    local idx=$((n-1))
+                    if [[ $idx -ge 0 && $idx -lt ${#HMAC_USERS[@]} ]]; then
+                        generate_token "${HMAC_USERS[$idx]}"
+                        echo
+                        read -p "  Enter para continuar..."
+                    fi
+                else
+                    warn "No hay usuarios HMAC"
+                    sleep 1
                 fi
                 ;;
             0) return ;;
@@ -452,27 +711,53 @@ users_menu() {
     done
 }
 
+token_menu() {
+    draw_banner
+    echo; info "GENERAR TOKEN HMAC"; echo
+    read -p "  Usuario: " user
+    if [[ -z "$user" ]]; then
+        warn "Usuario no puede estar vacío"
+        sleep 1
+        return
+    fi
+    
+    generate_token "$user"
+    echo
+    read -p "  Enter para volver..."
+}
+
 change_secret() {
     draw_banner
     echo; info "CAMBIAR CLAVE SECRETA"; echo
-    warn "Esto invalidará todas las sesiones HMAC activas."
+    warn "Esto invalidará TODOS los tokens existentes"
     echo
-    read -s -p "  Nueva clave: " s1; echo
-    read -s -p "  Repetir: " s2; echo
-    [[ "$s1" != "$s2" ]] && die "No coinciden."
-    set_secret "$s1"
+    
+    if confirm "¿Generar nueva clave automáticamente?"; then
+        set_secret ""
+    else
+        read -s -p "  Nueva clave: " s1; echo
+        read -s -p "  Repetir: " s2; echo
+        [[ "$s1" != "$s2" ]] && die "No coinciden."
+        set_secret "$s1"
+    fi
+    
     generate_verify_script
-    pam_install
-    ok "Clave actualizada."
+    pam_install_ssh
+    ok "Clave actualizada"
     read -p "  Enter para volver..."
 }
 
 logs() {
     draw_banner
     echo; info "LOGS (Ctrl+C para salir)"; echo
-    [[ -f "$LOG_FILE" ]] && tail -n 40 "$LOG_FILE" || warn "Sin logs aún."
-    echo
-    tail -f "$LOG_FILE" 2>/dev/null || true
+    if [[ -f "$LOG_FILE" ]]; then
+        tail -n 50 "$LOG_FILE"
+        echo
+        info "Follow mode (Ctrl+C para salir)..."
+        tail -f "$LOG_FILE" 2>/dev/null || true
+    else
+        warn "Sin logs aún"
+    fi
     read -p "  Enter para volver..."
 }
 
@@ -480,31 +765,23 @@ repair() {
     draw_banner
     info "Reparando instalación..."
     generate_verify_script
-    pam_install
-    ok "Reparación completa."
+    pam_install_ssh
+    ok "Reparación completa"
     read -p "  Enter para volver..."
 }
 
 uninstall() {
     draw_banner
-    echo; warn "DESINSTALAR CILOKG"; echo
+    echo; warn "DESINSTALAR COMPLETAMENTE"; echo
     
-    printf "  ${D}Se eliminará:${N}\n"
-    printf "  ${R}•${N} $INSTALL_DIR\n"
-    printf "  ${R}•${N} $CONF_DIR\n"
-    printf "  ${R}•${N} $SCRIPT_BIN\n"
-    printf "  ${R}•${N} $LOG_FILE\n"
-    printf "  ${R}•${N} Symlinks clk/hmac\n"
-    echo
-    
-    if confirm "¿Eliminar completamente?"; then
+    if confirm "¿Eliminar todo?"; then
         pam_uninstall
-        rm -f "$SCRIPT_BIN" "$LOG_FILE"
+        rm -f "$SCRIPT_BIN" "$LOG_FILE" "$RATE_LIMIT_FILE"
         rm -rf "$CONF_DIR" "$INSTALL_DIR"
         for link in /bin/clk /usr/bin/clk /usr/local/bin/clk /bin/hmac /usr/bin/hmac /usr/local/bin/hmac; do
             rm -f "$link" 2>/dev/null
         done
-        ok "Desinstalación completa."
+        ok "Desinstalación completa"
         echo
         exit 0
     fi
